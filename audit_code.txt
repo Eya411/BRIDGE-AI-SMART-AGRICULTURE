@@ -1,0 +1,898 @@
+
+========== configurations.py ==========
+
+import os
+import logging
+from pathlib import Path
+from time import strftime, gmtime
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import wandb
+from dotenv import load_dotenv
+
+from models import EfficientNetV2B3ViT
+
+# --------------------------------------------------
+# PROJECT PATHS
+# --------------------------------------------------
+
+SRC_DIR = Path(__file__).resolve().parent
+REPO_DIR = SRC_DIR.parent
+PROJECT_DIR = SRC_DIR.parents[2]
+
+DATA = PROJECT_DIR / "data"
+RESULTS_DIR = PROJECT_DIR / "results"
+CHECKPOINT_DIR = RESULTS_DIR / "checkpoints"
+LOG_DIR = RESULTS_DIR / "logs"
+
+for folder in [RESULTS_DIR, CHECKPOINT_DIR, LOG_DIR]:
+    folder.mkdir(parents=True, exist_ok=True)
+
+if not DATA.exists():
+    raise FileNotFoundError(f"Dataset introuvable : {DATA}")
+
+CLASSES = sorted([
+    p.name for p in DATA.iterdir() if p.is_dir()
+])
+
+FEATURES = len(CLASSES)
+
+if FEATURES != 7:
+    raise ValueError(f"7 classes attendues, {FEATURES} trouvées")
+
+# --------------------------------------------------
+# REPRODUCIBILITY
+# --------------------------------------------------
+
+RANDOM_STATE = 42
+
+import random
+import numpy as np
+
+random.seed(RANDOM_STATE)
+np.random.seed(RANDOM_STATE)
+torch.manual_seed(RANDOM_STATE)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(RANDOM_STATE)
+
+# --------------------------------------------------
+# DATASET
+# --------------------------------------------------
+
+TEST_SIZE = 0.1
+VALI_SIZE = 0.1
+
+# --------------------------------------------------
+# TRAINING
+# --------------------------------------------------
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+EPOCHS = 30
+BATCH_SIZE = 64
+
+lr = 0.0001
+WEIGHT_DECAY = 0.0001
+
+CRITERION = nn.CrossEntropyLoss()
+
+TRAINING = True
+AUGMENT = True
+DATATYPE = "potatodata"
+NEW_DATASET = True
+
+# --------------------------------------------------
+# MODEL
+# --------------------------------------------------
+
+MODELS = {
+    "EffNetViT": EfficientNetV2B3ViT().to(DEVICE)
+}
+
+OPTIMIZERS = {
+    "EffNetViT": optim.Adam(
+        MODELS["EffNetViT"].parameters(),
+        lr=lr,
+        weight_decay=WEIGHT_DECAY
+    )
+}
+
+SCHEDULER = {
+    "EffNetViT": optim.lr_scheduler.ReduceLROnPlateau(
+        OPTIMIZERS["EffNetViT"],
+        patience=5,
+        factor=0.5
+    )
+}
+
+# --------------------------------------------------
+# EXPERIMENT OUTPUT
+# --------------------------------------------------
+
+EXPERIMENT_NAME = "Hybrid_EffNetViT_30epochs_seed42"
+
+BEST_CHECKPOINT = (
+    CHECKPOINT_DIR / f"{EXPERIMENT_NAME}_best.pth"
+)
+
+LAST_CHECKPOINT = (
+    CHECKPOINT_DIR / f"{EXPERIMENT_NAME}_last.pth"
+)
+
+CSV_LOG = LOG_DIR / f"{EXPERIMENT_NAME}.csv"
+
+# --------------------------------------------------
+# WANDB
+# --------------------------------------------------
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s"
+)
+
+wandb_mode = (
+    "online" if os.getenv("WANDB_API_KEY") else "disabled"
+)
+
+wandb.init(
+    project=os.getenv("WANDB_PROJECT", "potato-disease-diagnosis"),
+    name=EXPERIMENT_NAME,
+    mode=wandb_mode,
+    config={
+        "epochs": EPOCHS,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": lr,
+        "weight_decay": WEIGHT_DECAY,
+        "seed": RANDOM_STATE,
+        "architecture": "EfficientNetV2B3_ViT",
+        "dataset": DATATYPE
+    }
+)
+
+print("Dataset:", DATA)
+print("Classes:", CLASSES)
+print("Nombre de classes:", FEATURES)
+print("Device:", DEVICE)
+print("Epochs:", EPOCHS)
+print("Batch size:", BATCH_SIZE)
+
+========== dataset.py ==========
+from configurations import *
+from utils import get_transforms_for_model
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Subset
+import logging
+from torchvision import datasets
+import numpy as np
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(message)s", datefmt="%d-%b-%y %H:%M:%S"
+)
+
+
+class Dataset:
+    def __init__(
+        self,
+        dataset=DATA,
+        test_size=TEST_SIZE,
+        vali_size=VALI_SIZE,
+        random_state=RANDOM_STATE,
+        augment=AUGMENT,
+    ):
+        self.dataset_name = dataset
+        self.test_size = test_size
+        self.vali_size = vali_size
+        self.random_state = random_state
+        self.augment = augment
+        self.train_transforms = get_transforms_for_model(augment)
+        self.other_transforms = get_transforms_for_model(False)
+        print(augment)
+
+    def prepare_dataset(self):
+        # Load dataset
+        dataset = datasets.ImageFolder(self.dataset_name)
+
+        # Get targets/labels from the dataset
+        targets = np.array([s[1] for s in dataset.samples])
+
+        # Split the dataset into train and test sets
+        train_indices, test_indices = train_test_split(
+            np.arange(len(targets)),
+            test_size=self.test_size,
+            random_state=self.random_state,
+        )
+        train_indices, vali_indices = train_test_split(
+            train_indices,
+            test_size=self.vali_size,
+            random_state=self.random_state,
+        )
+
+        # Create subsets from the indices
+        train_dataset = Subset(dataset, train_indices)
+        vali_dataset = Subset(dataset, vali_indices)
+        test_dataset = Subset(dataset, test_indices)
+        # print("Train, valid, test", len(train_dataset), len(vali_dataset), len(test_dataset))
+        if self.augment:
+            train_dataset.dataset.transform = self.train_transforms
+        vali_dataset.dataset.transform = self.other_transforms
+        test_dataset.dataset.transform = self.other_transforms
+
+        # Create data loaders
+        train_dl = DataLoader(
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+        )
+        vali_dl = DataLoader(
+            vali_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+        )
+        test_dl = DataLoader(
+            test_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+        )
+
+        return train_dl, vali_dl, test_dl
+
+========== utils.py ==========
+from torchvision import transforms
+import os
+from torchvision.transforms import Lambda
+from imgaug import augmenters as iaa
+import numpy as np
+from PIL import Image
+
+
+def get_transforms_for_model(augment):
+    if augment:
+        # data_transforms = transforms.Compose(  # trying to reproduce the same results in the paper
+        #     [
+        #         transforms.Resize((224, 224)),  # Resize images to 224x224
+        #         transforms.RandomHorizontalFlip(),  # Horizontal flipping
+        #         transforms.RandomVerticalFlip(),  # Vertical flipping
+        #         transforms.RandomRotation(15),  # Rotation
+        #         transforms.RandomResizedCrop(224, scale=(0.8, 1.2)),  # Zooming
+        #         transforms.ColorJitter(brightness=0.2),  # Brightness adjustment
+        #         transforms.RandomAffine(
+        #             0, translate=(0.1, 0.1)
+        #         ),  # Horizontal and vertical shifting
+        #         transforms.ToTensor(),
+        #         transforms.Normalize(
+        #             [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        #         ),  # Normalization
+        #     ]
+        # )
+        data_transforms = transforms.Compose(  # My settings
+            [
+                transforms.Resize(256),  # Resize the shortest side of the image to 256
+                transforms.RandomResizedCrop(
+                    224,
+                    scale=(0.95, 1.05),  # Adjust scale for more intense zooming
+                    ratio=(0.75, 1.33),
+                    interpolation=transforms.InterpolationMode.BICUBIC,
+                ),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomVerticalFlip(),
+                transforms.RandomRotation([-40, 40]),  # Increase rotation range
+                transforms.ColorJitter(saturation=0.8, hue=0.021),
+                # Add contrast and saturation adjustment
+                transforms.RandomAffine(
+                    degrees=0,
+                    translate=(
+                        0.13,
+                        0.13,
+                    ),  # Increase translate values for more shifting
+                    scale=(
+                        0.8,
+                        1.2,
+                    ),  # Adjust scale values for additional zooming effect
+                ),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+    else:
+        data_transforms = transforms.Compose(
+            [
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+    return data_transforms
+
+
+# Get the number of classes to feed in the model architecture as FEATURES
+DATA = "../data/potatodata"
+CLASSES = sorted(os.listdir(DATA))
+FEATURES = len(CLASSES)
+
+========== models.py ==========
+from torch import nn
+from transformers import ViTModel
+from utils import *
+from timm import create_model
+import torch
+from torchsummary import summary
+from torchinfo import summary
+
+
+class EfficientNetV2B3(nn.Module):
+    def __init__(self):
+        super(EfficientNetV2B3, self).__init__()
+        self.effnet = create_model("tf_efficientnetv2_b3.in21k", pretrained=True)
+
+        for param in self.effnet.parameters():
+            param.requires_grad = False
+
+        self.effnet.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(1536, FEATURES)
+        )
+
+    def forward(self, x):
+        return self.effnet(x)
+
+
+class ViT(nn.Module):
+    def __init__(self, num_labels=FEATURES):
+        super(ViT, self).__init__()
+        self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
+        for param in self.vit.parameters():
+            param.requires_grad = False
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Linear(self.vit.config.hidden_size, num_labels)
+        self.num_labels = num_labels
+
+    def forward(self, pixel_values, labels=None):
+        outputs = self.vit(pixel_values=pixel_values)
+        output = self.dropout(outputs.last_hidden_state[:, 0])
+        logits = self.classifier(output)
+
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+        if loss is not None:
+            return logits, loss.item()
+        else:
+            return logits, None
+
+
+# https://arxiv.org/abs/1608.06993
+class DenseNet121(nn.Module):
+    def __init__(self):
+        super(DenseNet121, self).__init__()
+        self.model = create_model("densenet121", pretrained=True)
+        for param in self.model.parameters():
+            param.requires_grad = False
+        self.model.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(1024, FEATURES)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class MobileNetV3_large(nn.Module):
+    def __init__(self):
+        super(MobileNetV3_large, self).__init__()
+        self.model = create_model("mobilenetv3_large_100", pretrained=True)
+        for param in self.model.parameters():
+            param.requires_grad = False
+        self.model.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(1280, FEATURES)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class VGG16(nn.Module):
+    def __init__(self, num_classes=FEATURES):
+        super(VGG16, self).__init__()
+        self.model = create_model("vgg16", pretrained=True)
+
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        # Replaced the last linear layer in the head section
+        num_features = self.model.head.fc.in_features
+        self.model.head.fc = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(num_features, num_classes)
+        )
+        for param in self.model.head.fc.parameters():
+            param.requires_grad = True
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class ResNet50(nn.Module):
+    def __init__(self):
+        super(ResNet50, self).__init__()
+        self.model = create_model("resnet50.a1_in1k", pretrained=True)
+        for param in self.model.parameters():
+            param.requires_grad = False
+        self.model.fc = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(2048, FEATURES)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class EfficientNetV2B3ViT(nn.Module):  # initial hybrid model EfficientNetV2B3+ViT
+    def __init__(self, num_labels=FEATURES):
+        super(EfficientNetV2B3ViT, self).__init__()
+
+        # Part of EfficientNet
+        self.effnet = create_model("tf_efficientnetv2_b3.in21k", pretrained=True)
+        self.effnet.classifier = nn.Identity()  # Remove the classifier
+        for param in self.effnet.parameters():
+            param.requires_grad = False  # Freeze the EfficientNet parameters
+
+        # Part of ViT
+        self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
+        self.vit_linear = nn.Linear(self.vit.config.hidden_size, 512)
+        for param in self.vit.parameters():
+            param.requires_grad = False  # Freeze the ViT parameters
+
+        self.dropout = nn.Dropout(0.2)
+        self.classifier = nn.Linear(1536 + 512, num_labels)  # Adjusted to match the output of vit_linear
+
+    def forward(self, x):
+        # Extract features using EfficientNet
+        effnet_output = self.effnet.forward_features(x)
+        effnet_output = torch.flatten(effnet_output, start_dim=2)  # Flatten the output
+        effnet_output = effnet_output.mean(dim=2)  # Global average pooling
+
+        # Feed the input into ViT
+        vit_output = self.vit(pixel_values=x)['last_hidden_state'][:, 0]
+        vit_output = self.vit_linear(vit_output)  # Reduce the dimensionality of the ViT output
+
+        # Combine the outputs
+        combined = torch.cat((effnet_output, vit_output), dim=1)
+
+        # Apply dropout
+        combined = self.dropout(combined)
+
+        output = self.classifier(combined)  # Get the final output
+
+        return output
+
+
+class DenseNet121ViT(nn.Module):
+    def __init__(self):
+        super(DenseNet121ViT, self).__init__()
+        self.densenet = create_model("densenet121", pretrained=True)
+        self.densenet.classifier = nn.Identity()
+        for param in self.densenet.parameters():
+            param.requires_grad = False
+        self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
+        self.vit_linear = nn.Linear(self.vit.config.hidden_size, 512)
+        for param in self.vit.parameters():
+            param.requires_grad = False
+        self.dropout = nn.Dropout(0.2)
+        self.classifier = nn.Linear(1024 + 512, FEATURES)
+
+    def forward(self, x):
+        # Extract features using DenseNet121
+        densenet_output = self.densenet.forward_features(x)
+        densenet_output = torch.flatten(densenet_output, start_dim=2)
+        densenet_output = densenet_output.mean(dim=2)
+
+        # Feed the input into ViT
+        vit_output = self.vit(pixel_values=x)['last_hidden_state'][:, 0]
+        vit_output = self.vit_linear(vit_output)
+
+        # Combine the outputs
+        combined = torch.cat((densenet_output, vit_output), dim=1)
+
+        # Apply dropout
+        combined = self.dropout(combined)
+
+        output = self.classifier(combined)
+
+        return output
+
+
+class MobileNetV3ViT(nn.Module):
+    def __init__(self):
+        super(MobileNetV3ViT, self).__init__()
+        self.mobilenetv3 = create_model("mobilenetv3_large_100", pretrained=True)
+        self.mobilenetv3.classifier = nn.Identity()
+        for param in self.mobilenetv3.parameters():
+            param.requires_grad = False
+        self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
+        self.vit_linear = nn.Linear(self.vit.config.hidden_size, 512)
+        for param in self.vit.parameters():
+            param.requires_grad = False
+        self.dropout = nn.Dropout(0.2)
+        self.classifier = nn.Linear(960 + 512, FEATURES)
+
+    def forward(self, x):
+        # Extract features using MobileNetV3
+        mobilenetv3_output = self.mobilenetv3.forward_features(x)
+        mobilenetv3_output = torch.flatten(mobilenetv3_output, start_dim=2)
+        mobilenetv3_output = mobilenetv3_output.mean(dim=2)
+
+        # Feed the input into ViT
+        vit_output = self.vit(pixel_values=x)['last_hidden_state'][:, 0]
+        vit_output = self.vit_linear(vit_output)
+
+        # Combine the outputs
+        combined = torch.cat((mobilenetv3_output, vit_output), dim=1)
+
+        # Apply dropout
+        combined = self.dropout(combined)
+
+        output = self.classifier(combined)
+
+        return output
+
+
+class VGG16ViT(nn.Module):
+    def __init__(self):
+        super(VGG16ViT, self).__init__()
+        self.vgg16 = create_model("vgg16", pretrained=True)
+        self.vgg16.classifier = nn.Identity()
+        for param in self.vgg16.parameters():
+            param.requires_grad = False
+        self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
+        self.vit_linear = nn.Linear(self.vit.config.hidden_size, 512)
+        for param in self.vit.parameters():
+            param.requires_grad = False
+        self.dropout = nn.Dropout(0.2)
+        self.classifier = nn.Linear(512 + 512, FEATURES)
+
+    def forward(self, x):
+        # Extract features using VGG16
+        vgg16_output = self.vgg16.forward_features(x)
+        vgg16_output = torch.flatten(vgg16_output, start_dim=2)
+        vgg16_output = vgg16_output.mean(dim=2)
+
+        # Feed the input into ViT
+        vit_output = self.vit(pixel_values=x)['last_hidden_state'][:, 0]
+        vit_output = self.vit_linear(vit_output)
+
+        # Combine the outputs
+        combined = torch.cat((vgg16_output, vit_output), dim=1)
+
+        # Apply dropout
+        combined = self.dropout(combined)
+
+        output = self.classifier(combined)
+
+        return output
+
+
+class ResNet50ViT(nn.Module):
+    def __init__(self):
+        super(ResNet50ViT, self).__init__()
+        self.resnet50 = create_model("resnet50.a1_in1k", pretrained=True)
+        self.resnet50.fc = nn.Identity()
+        for param in self.resnet50.parameters():
+            param.requires_grad = False
+        self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
+        self.vit_linear = nn.Linear(self.vit.config.hidden_size, 512)
+        for param in self.vit.parameters():
+            param.requires_grad = False
+        self.dropout = nn.Dropout(0.2)
+        self.classifier = nn.Linear(2048 + 512, FEATURES)
+
+    def forward(self, x):
+        # Extract features using ResNet50
+        resnet50_output = self.resnet50.forward_features(x)
+        resnet50_output = torch.flatten(resnet50_output, start_dim=2)
+        resnet50_output = resnet50_output.mean(dim=2)
+
+        # Feed the input into ViT
+        vit_output = self.vit(pixel_values=x)['last_hidden_state'][:, 0]
+        vit_output = self.vit_linear(vit_output)
+
+        # Combine the outputs
+        combined = torch.cat((resnet50_output, vit_output), dim=1)
+
+        # Apply dropout
+        combined = self.dropout(combined)
+
+        output = self.classifier(combined)
+
+        return output
+
+
+
+========== train.py ==========
+from configurations import *
+import torch
+import logging
+import wandb
+from dataset import Dataset
+from datetime import datetime
+
+# import pdb; pdb.set_trace()
+now = datetime.now()
+time = now.strftime("%H%M%S")
+
+
+class Trainer:
+    def __init__(
+            self,
+            models,
+            device,
+            train_loader,
+            vali_loader,
+            criterion,
+            optimizers,
+            schedulers,
+    ):
+        self.models = models
+        self.device = device
+        self.train_loader = train_loader
+        self.vali_loader = vali_loader
+        self.criterion = criterion
+        self.optimizer = optimizers
+        self.scheduler = schedulers
+        self.best_acc = {model_name: 0.0 for model_name in self.models.keys()}
+
+    # Train and validate models
+    def train_and_validate(self, num_epochs):
+        for epoch in range(num_epochs):
+            for model_name, model in self.models.items():
+                model.train()
+                running_loss, running_acc = 0.0, 0.0
+                total_samples = 0
+                for images, labels in self.train_loader:
+                    images, labels = images.to(self.device), labels.to(self.device)
+
+                    self.optimizer[model_name].zero_grad()
+
+                    outputs = model(images)
+                    # Caters for VIT model
+                    if isinstance(outputs, tuple):
+                        logits, loss = outputs
+                        if loss is None:
+                            loss = self.criterion(logits, labels)
+                    else:
+                        logits = outputs
+                        loss = self.criterion(logits, labels)
+                    # End catering for VIT model
+                    # loss = self.criterion(outputs, labels)
+                    loss.backward()
+                    self.optimizer[model_name].step()
+
+                    running_loss += loss.item()
+                    _, predicted = torch.max(logits, 1)
+                    running_acc += (predicted == labels).sum().item()
+                    total_samples += labels.size(0)
+
+                avg_loss = running_loss / len(self.train_loader)
+                avg_acc = running_acc / total_samples
+                logging.info(
+                    f"Epoch {epoch + 1}, Model {model_name}, Train Loss: {avg_loss:.4f}, Train Accuracy: {avg_acc:.4f}"
+                )
+                wandb.log(
+                    {
+                        f"{model_name} Train Loss": avg_loss,
+                        f"{model_name} Train Accuracy": avg_acc,
+                    }
+                )
+
+            # Validate the model get loss and accuracy
+            for model_name, model in self.models.items():
+                model.eval()
+                running_loss, running_acc = 0.0, 0.0
+                total_samples = 0
+                with torch.no_grad():
+                    for images, labels in self.vali_loader:
+                        images, labels = images.to(self.device), labels.to(self.device)
+
+                        outputs = model(images)
+                        # Caters for VIT model
+                        if isinstance(outputs, tuple):
+                            logits, loss = outputs
+                            if loss is None:
+                                loss = self.criterion(logits, labels)
+                        else:
+                            logits = outputs
+                            loss = self.criterion(logits, labels)
+                        # End catering for VIT model
+                        # loss = self.criterion(outputs, labels)
+                        running_loss += loss.item()
+                        _, predicted = torch.max(logits, 1)
+                        running_acc += (predicted == labels).sum().item()
+                        total_samples += labels.size(0)
+
+                avg_loss = running_loss / len(self.vali_loader)
+                avg_acc = running_acc / total_samples
+                logging.info(
+                    f"Epoch {epoch + 1}, Model {model_name}, Validation Loss: {avg_loss:.4f}, Validation Accuracy: {avg_acc:.4f}"
+                )
+                wandb.log(
+                    {
+                        f"{model_name} Validation Loss": avg_loss,
+                        f"{model_name} Validation Accuracy": avg_acc,
+                    }
+                )
+                # Update the learning rate
+                self.scheduler[model_name].step(avg_loss)
+                current_lr = self.optimizer[model_name].param_groups[0]["lr"]
+                logging.info(f"Current learning rate for {model_name}: {current_lr}")
+
+        for model_name, model in self.models.items():
+            torch.save(
+                model.state_dict(),
+                f"{model_name}_{DATATYPE}_Aug_{AUGMENT}_{time}_2025.pth",
+            )
+            logging.info(f"Saved last model for {model_name}")
+
+
+if __name__ == "__main__":
+    dataset = Dataset()
+    train_loader, vali_loader, _ = dataset.prepare_dataset()
+    trainer = Trainer(
+        MODELS, DEVICE, train_loader, vali_loader, CRITERION, OPTIMIZERS, SCHEDULER
+    )
+    trainer.train_and_validate(EPOCHS)
+
+    wandb.finish()
+
+========== test.py ==========
+import matplotlib.pyplot as plt
+from PIL import Image
+import io
+from configurations import *
+from dataset import Dataset
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    accuracy_score,
+    confusion_matrix,
+    matthews_corrcoef,
+)
+import seaborn as sns
+import torch
+import numpy as np
+import logging
+
+
+class Tester:
+    def __init__(self, models, device, test_loader, criterion):
+        self.device = device
+        self.models = {
+            model_name: self.load_model(model_class, SAVED_MODELS[model_name])
+            for model_name, model_class in models.items()
+        }
+        self.test_loader = test_loader
+        self.criterion = criterion
+
+    def load_model(self, model_class, saved_model_path):
+        model = model_class().to(self.device)
+        model.load_state_dict(torch.load(saved_model_path, map_location=self.device))
+        model.eval()
+        return model
+
+    def test_models(self):
+        for model_name, model in self.models.items():
+            model.eval()
+            running_loss, running_acc = 0.0, 0.0
+            total_samples = 0
+            all_labels = []
+            all_predictions = []
+            class_correct = list(0.0 for i in range(len(CLASSES)))
+            class_total = list(0.0 for i in range(len(CLASSES)))
+            with torch.no_grad():
+                for images, labels in self.test_loader:
+                    images, labels = images.to(self.device), labels.to(self.device)
+                    outputs = model(images)
+                    # Caters for VIT model
+                    if isinstance(outputs, tuple):
+                        logits, loss = outputs
+                        if loss is None:
+                            loss = self.criterion(logits, labels)
+                    else:
+                        logits = outputs
+                        loss = self.criterion(logits, labels)
+                    # End catering for VIT model
+                    running_loss += loss.item()
+                    _, predicted = torch.max(logits, 1)
+                    running_acc += (predicted == labels).sum().item()
+                    total_samples += labels.size(0)
+                    all_labels.extend(labels.cpu().numpy())
+                    all_predictions.extend(predicted.cpu().numpy())
+                    class_correct, class_total = self.calculate_classwise_accuracy(
+                        labels, predicted, class_correct, class_total
+                    )
+
+            all_labels = np.array(all_labels)
+            all_predictions = np.array(all_predictions)
+            avg_loss = running_loss / len(self.test_loader)
+            avg_acc = running_acc / total_samples
+            self.calculate_and_log_metrics(
+                model_name, all_labels, all_predictions, avg_loss, class_correct, class_total
+            )
+            self.log_confusion_matrix(model_name, all_labels, all_predictions)
+
+    @staticmethod
+    def calculate_classwise_accuracy(labels, predicted, class_correct, class_total):
+        for label, prediction in zip(labels, predicted):
+            if label == prediction:
+                class_correct[label] += 1
+            class_total[label] += 1
+        return class_correct, class_total
+
+    @staticmethod
+    def calculate_and_log_metrics(model_name, all_labels, all_predictions, avg_loss, class_correct, class_total):
+        accuracy = accuracy_score(all_labels, all_predictions)
+        precision = precision_score(all_labels, all_predictions, average="macro")
+        recall = recall_score(all_labels, all_predictions, average="macro")
+        f1 = f1_score(all_labels, all_predictions, average="macro")
+        mcc = matthews_corrcoef(all_labels, all_predictions)
+        logging.info(
+            f"Model {model_name}, Test Loss: {avg_loss:.4f}, Test Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}, MCC: {mcc:.4f}"
+        )
+        # Class-wise metrics
+        precision_classwise = precision_score(all_labels, all_predictions, average=None)
+        recall_classwise = recall_score(all_labels, all_predictions, average=None)
+        f1_classwise = f1_score(all_labels, all_predictions, average=None)
+
+        for i in range(len(CLASSES)):
+            class_accuracy = 100 * class_correct[i] / class_total[i]
+            mcc_classwise = matthews_corrcoef(all_labels == i, all_predictions == i)
+            logging.info(
+                f"Class {CLASSES[i]}, Accuracy: {class_accuracy:.2f}%, Precision: {precision_classwise[i]:.4f}, Recall: {recall_classwise[i]:.4f}, F1: {f1_classwise[i]:.4f}, MCC: {mcc_classwise:.4f}"
+            )
+
+    @staticmethod
+    def log_confusion_matrix(model_name, all_labels, all_predictions):
+        cm = confusion_matrix(all_labels, all_predictions, labels=range(len(CLASSES)))
+        plt.figure(figsize=(10, 10))
+        sns.heatmap(
+            cm,
+            annot=True,
+            fmt="d",
+            cmap="Blues",
+            xticklabels=CLASSES,
+            yticklabels=CLASSES,
+        )
+        plt.title(f"{model_name} Confusion Matrix")
+        plt.xlabel("Predicted Labels")
+        plt.ylabel("True Labels")
+        plt.xticks(rotation=45)
+        plt.yticks(rotation=45)
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png")
+        buf.seek(0)
+        image = Image.open(buf)
+        wandb.log({f"{model_name} Confusion Matrix": wandb.Image(image)})
+        plt.close()
+
+
+if __name__ == "__main__":
+    dataset = Dataset()
+    _, _, test_loader = dataset.prepare_dataset()
+    tester = Tester(MODELS, DEVICE, test_loader, CRITERION)
+    tester.test_models()
+    wandb.finish()

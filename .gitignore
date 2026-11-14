@@ -1,0 +1,49 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+.venv311/
+.venv_tf/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Deep Learning checkpoints
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.keras
+*.onnx
+
+# Dataset - adjust if you intend to publish it
+data/
+dataset/
+datasets/
+
+# Temporary files
+*.tmp
+.DS_Store
+Thumbs.db
